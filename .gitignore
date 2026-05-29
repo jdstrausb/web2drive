@@ -1,0 +1,18 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local credentials (if kept in the workspace)
+credentials.json
+token.json
+.env
+
+# macOS system files
+.DS_Store
