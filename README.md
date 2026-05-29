@@ -1,6 +1,6 @@
 # Web2Drive
 
-Web2Drive is a terminal utility for macOS that fetches web pages (HTML, raw Markdown, or plain text), parses and formats the essential content into clean Markdown, and uploads the resulting document directly to a dedicated `Web2Drive` folder in your Google Drive account.
+Web2Drive is a terminal utility that fetches web pages (HTML, raw Markdown, or plain text), parses and formats the essential content into clean Markdown, and uploads the resulting document directly to a dedicated `Web2Drive` folder in your Google Drive account.
 
 This utility is designed for rapid delivery of clean context files (like reference articles or READMEs) directly into a web interface using its "Add from Drive" capability, without cluttering your local machine.
 
