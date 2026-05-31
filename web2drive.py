@@ -5,6 +5,7 @@ import re
 import json
 import tempfile
 import urllib.parse
+import subprocess
 import requests
 from bs4 import BeautifulSoup
 import html2text
@@ -20,9 +21,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.http import MediaFileUpload
 
-from pydantic import BaseModel, Field
-from typing import List
-
 # Scopes required to upload files the script creates
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
@@ -31,20 +29,43 @@ CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "token.json")
 COOKIES_PATH = os.path.join(CONFIG_DIR, "cookies.json")
 
+# Import Pydantic for structured validation
+from pydantic import BaseModel, Field
+from typing import List
+
+
+class PageMetadata(BaseModel):
+    filename: str = Field(
+        description="A clean, highly descriptive, and concise filename ending in '.md'. "
+        "Use only letters, numbers, underscores, and hyphens (no spaces). "
+        "Do not exceed 60 characters in total."
+    )
+    summary: str = Field(
+        description="A concise, 3-sentence executive summary of the core content."
+    )
+    tags: List[str] = Field(
+        description="A list of 3 to 5 highly relevant keywords or category tags."
+    )
+    reading_time: int = Field(
+        description="Estimated reading time in minutes based on document length and complexity."
+    )
+
 
 def print_help():
     """Prints usage documentation for the CLI utility."""
     help_text = """Web2Drive Utility
 -----------------
-Fetches the content of a URL, cleans up non-essential structural elements,
-and uploads the parsed Markdown file directly to a dedicated 'Web2Drive' 
-folder in your Google Drive.
+Fetches the content of a URL or reads from the system clipboard, 
+cleans up non-essential structural elements, and uploads the parsed 
+Markdown file directly to a dedicated 'Web2Drive' folder in Google Drive.
 
 Usage:
   web2drive <URL>
+  web2drive --clip | -c
   web2drive --help | -h
 
 Options:
+  -c, --clip    Parse and upload content directly from the system clipboard.
   -h, --help    Show this usage documentation.
 """
     print(help_text)
@@ -73,8 +94,6 @@ def get_gdrive_service():
         with open(TOKEN_PATH, "w") as token:
             token.write(creds.to_json())
 
-    # Note: google-api-python-client is still used for Google Drive API.
-    # The unified google-genai library focuses on model inference.
     from googleapiclient.discovery import build
 
     return build("drive", "v3", credentials=creds)
@@ -101,22 +120,74 @@ def get_fallback_filename(url):
     return "webpage_content"
 
 
-# Define the structure we want the LLM to return
-class PageMetadata(BaseModel):
-    filename: str = Field(
-        description="A clean, highly descriptive, and concise filename ending in '.md'. "
-        "Use only letters, numbers, underscores, and hyphens (no spaces). "
-        "Do not exceed 60 characters in total."
+def get_clipboard_content():
+    """Reads content from the system clipboard across platforms using subprocess."""
+    # Try macOS (pbpaste)
+    try:
+        result = subprocess.run(["pbpaste"], capture_output=True, text=True, check=True)
+        return result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    # Try Linux (xclip)
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    # Try Linux (xsel)
+    try:
+        result = subprocess.run(
+            ["xsel", "-b", "-o"], capture_output=True, text=True, check=True
+        )
+        return result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    # Try Wayland (wl-paste)
+    try:
+        result = subprocess.run(
+            ["wl-paste"], capture_output=True, text=True, check=True
+        )
+        return result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    print(
+        "❌ Error: No supported clipboard utility found (pbpaste, xclip, xsel, wl-paste).",
+        file=sys.stderr,
     )
-    summary: str = Field(
-        description="A concise, 3-sentence executive summary of the core content."
-    )
-    tags: List[str] = Field(
-        description="A list of 3 to 5 highly relevant keywords or category tags."
-    )
-    reading_time: int = Field(
-        description="Estimated reading time in minutes based on document length and complexity."
-    )
+    return None
+
+
+def is_html_string(text):
+    """Heuristic check to identify if a block of text contains rich HTML code."""
+    cleaned_start = text.strip()[:150].lower()
+    if cleaned_start.startswith("<!doctype") or cleaned_start.startswith("<html"):
+        return True
+
+    # Track standard structural blocks to differentiate from code blocks containing stray tags
+    tags = [
+        "<div",
+        "<p>",
+        "<p ",
+        "<span",
+        "<section",
+        "<h1",
+        "<h2",
+        "<h3",
+        "</a>",
+        "</div>",
+    ]
+    text_lower = text.lower()
+    match_count = sum(text_lower.count(tag) for tag in tags)
+    return match_count >= 3
 
 
 def generate_metadata_and_filename(url, markdown_content):
@@ -130,36 +201,32 @@ def generate_metadata_and_filename(url, markdown_content):
 
     try:
         client = genai.Client(api_key=api_key)
-        content_sample = markdown_content[
-            :8000
-        ]  # Slightly larger context sample for better summaries
+        content_sample = markdown_content[:8000]
 
         prompt = (
             "You are an expert document archivist. Analyze the following URL and content sample "
             "to extract a structured metadata profile and determine a clean, professional filename."
         )
 
-        # Call gemini-3.1-flash-lite with structured JSON output configurations
         response = client.models.generate_content(
             model="gemini-3.1-flash-lite",
             contents=[prompt, f"URL: {url}", f"Content Sample:\n{content_sample}"],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_json_schema=PageMetadata,
-                temperature=0.2,  # Lower temperature for more consistent, factual extraction
-            ),
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": PageMetadata.model_json_schema(),
+                "temperature": 0.2,
+            },
         )
 
         if not response.text:
             return None, None
 
-        # Parse the reliable JSON response
         data = json.loads(response.text)
 
-        # Format the metadata block to prepend to the Markdown document
         tags_line = ", ".join(
             [f"`#{tag.strip().replace(' ', '')}`" for tag in data.get("tags", [])]
         )
+
         metadata_header = (
             f"---\n"
             f"**Source:** {url}\n"
@@ -172,7 +239,6 @@ def generate_metadata_and_filename(url, markdown_content):
         )
 
         filename = data.get("filename", "")
-        # Fallback validation to ensure filename is safe
         if not filename.lower().endswith(".md"):
             filename += ".md"
         filename = re.sub(r'[\\/*?:"<>|\s]', "_", filename)
@@ -269,21 +335,14 @@ def fetch_with_playwright(url):
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
             )
 
-            # Authenticate context if cookies exist
             cookies = load_session_cookies()
             if cookies:
                 print("🔑 Injecting authentication cookies into Playwright context...")
                 context.add_cookies(cookies)
 
             page = context.new_page()
-
-            # Navigate and wait for network to be idle to ensure SPA is loaded
             page.goto(url, wait_until="networkidle", timeout=25000)
-
-            # Dismiss blocking overlays before reading DOM content
             clean_page_overlays(page)
-
-            # Allow additional time for frameworks to finish layout hydration
             page.wait_for_timeout(1000)
 
             html_content = page.content()
@@ -301,15 +360,72 @@ def fetch_with_playwright(url):
         return None
 
 
+def pre_clean_html(html_text):
+    """
+    Decomposes comment lists, sidebars, related items, headers, footers,
+    and general layout noise to ensure only the core text is processed.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    noise_selectors = [
+        # Layout components
+        "header",
+        "footer",
+        "nav",
+        "aside",
+        "noscript",
+        "iframe",
+        "style",
+        "script",
+        # Comments and community sections
+        "#comments",
+        ".comments",
+        "#disqus_thread",
+        ".commentlist",
+        ".comment-respond",
+        "#respond",
+        ".reply",
+        # Sidebars and widgets
+        ".sidebar",
+        "#sidebar",
+        ".widget-area",
+        ".secondary",
+        ".related",
+        ".recent-posts",
+        ".archives",
+        ".categories",
+        ".tagcloud",
+        # Sharing networks and tracking indicators
+        ".social-share",
+        ".share-buttons",
+        ".author-bio",
+        ".post-author",
+        ".entry-utility",
+        # Custom WordPress elements
+        ".sharedaddy",
+        "#jp-post-flair",
+        ".subscribe-block",
+        "#subscribe-blog",
+        ".wpcnt",
+    ]
+
+    for selector in noise_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+
+    return str(soup)
+
+
 def extract_html_content(url, html_text):
     """Processes raw HTML text, returning filename suggestions and parsed markdown body."""
+    cleaned_html = pre_clean_html(html_text)
+
     title = ""
     markdown_text = None
 
     try:
-        # Attempt semantic extraction using trafilatura
         result = trafilatura.bare_extraction(
-            html_text,
+            cleaned_html,
             output_format="markdown",
             include_links=True,
             include_images=True,
@@ -328,7 +444,7 @@ def extract_html_content(url, html_text):
         if title:
             filename = f"{clean_filename(title)}.md"
         else:
-            soup = BeautifulSoup(html_text, "html.parser")
+            soup = BeautifulSoup(cleaned_html, "html.parser")
             title_tag = soup.find("title")
             if title_tag and title_tag.get_text().strip():
                 title = title_tag.get_text().strip()
@@ -336,8 +452,7 @@ def extract_html_content(url, html_text):
             else:
                 filename = f"{get_fallback_filename(url)}.md"
     else:
-        # Static fallback if trafilatura fails to parse/return body
-        soup = BeautifulSoup(html_text, "html.parser")
+        soup = BeautifulSoup(cleaned_html, "html.parser")
 
         title_tag = soup.find("title")
         if title_tag and title_tag.get_text().strip():
@@ -351,11 +466,6 @@ def extract_html_content(url, html_text):
             filename = f"{clean_filename(title)}.md"
         else:
             filename = f"{get_fallback_filename(url)}.md"
-
-        for element in soup(
-            ["script", "style", "nav", "footer", "header", "noscript", "iframe"]
-        ):
-            element.decompose()
 
         body_content = soup.find("article") or soup.find("main") or soup.body or soup
 
@@ -379,7 +489,6 @@ def fetch_and_convert(url):
         }
     )
 
-    # Authenticate static session if cookies exist
     cookies = load_session_cookies()
     if cookies:
         print("🔑 Applying authentication cookies to static request...")
@@ -422,21 +531,18 @@ def fetch_and_convert(url):
         if not html_text:
             sys.exit(1)
 
-    # Clean HTML contents
     filename, markdown_text = extract_html_content(url, html_text)
 
-    # Evaluate if retrieved content is insufficient
     clean_text_only = markdown_text.replace(f"**Source:** {url}\n\n---\n\n", "").strip()
 
     insufficient = False
-    if len(clean_text_only) < 300:
+    if len(clean_text_only) < 400:
         insufficient = True
-    elif "javascript" in clean_text_only.lower() and (
-        "enable" in clean_text_only.lower()
-        or "required" in clean_text_only.lower()
-        or "disabled" in clean_text_only.lower()
-    ):
-        insufficient = True
+    elif len(clean_text_only) < 1500:
+        if "javascript" in clean_text_only.lower() and any(
+            x in clean_text_only.lower() for x in ["enable", "required", "disabled"]
+        ):
+            insufficient = True
 
     if insufficient:
         print(
@@ -506,11 +612,36 @@ def main():
         print_help()
         sys.exit(0)
 
-    url = sys.argv[1]
-    print(f"⏳ Extracting content from: {url}...")
-    filename, markdown_content = fetch_and_convert(url)
+    # Determine execution source
+    use_clipboard = sys.argv[1] in ("-c", "--clip")
 
-    # Clean standard source line if we are going to use the custom structured header
+    if use_clipboard:
+        print("⏳ Reading content from system clipboard...")
+        raw_content = get_clipboard_content()
+        if not raw_content or not raw_content.strip():
+            print("❌ Error: Clipboard is empty or could not be read.", file=sys.stderr)
+            sys.exit(1)
+
+        url = "Clipboard"
+
+        if is_html_string(raw_content):
+            print(
+                "⏳ Detected HTML structure in clipboard. Extracting main content body..."
+            )
+            filename, markdown_content = extract_html_content(url, raw_content)
+        else:
+            print("⏳ Detected plain text/Markdown structure in clipboard.")
+            filename = "clipboard_content.md"
+            h1_match = re.search(r"^#\s+(.+)$", raw_content, re.MULTILINE)
+            if h1_match:
+                filename = f"{clean_filename(h1_match.group(1).strip())}.md"
+            markdown_content = raw_content
+    else:
+        url = sys.argv[1]
+        print(f"⏳ Extracting content from: {url}...")
+        filename, markdown_content = fetch_and_convert(url)
+
+    # Clean standard fallback source line to prevent duplication
     clean_content_body = markdown_content.replace(f"**Source:** {url}\n\n---\n\n", "")
 
     # Retrieve filename and structured metadata from Gemini
@@ -520,10 +651,8 @@ def main():
 
     if llm_filename and metadata_header:
         filename = llm_filename
-        # Combine the custom header with the cleaned body
         final_document = metadata_header + clean_content_body
     else:
-        # Fallback to the original structure if the LLM call failed
         final_document = markdown_content
 
     temp_file = tempfile.NamedTemporaryFile(
