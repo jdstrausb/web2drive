@@ -7,6 +7,7 @@ import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 import html2text
+import trafilatura
 
 # Import the modern Google Gen AI SDK
 from google import genai
@@ -153,74 +154,188 @@ def generate_llm_filename(url, markdown_content):
         return None
 
 
+def fetch_with_playwright(url):
+    """Fallback fetcher using headless Playwright to handle JavaScript-heavy SPAs."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "⚠️ Playwright package is not installed. To support dynamic SPAs, install it via:\n"
+            "  pip install playwright && playwright install chromium",
+            file=sys.stderr,
+        )
+        return None
+
+    print("⏳ Launching headless browser via Playwright to load dynamic content...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            )
+            page = context.new_page()
+
+            # Navigate and wait for network to be idle to ensure SPA is loaded
+            page.goto(url, wait_until="networkidle", timeout=25000)
+
+            # Allow additional time for frameworks to finish layout hydration
+            page.wait_for_timeout(2000)
+
+            html_content = page.content()
+            browser.close()
+            return html_content
+    except Exception as e:
+        if "playwright install" in str(e).lower() or "executable" in str(e).lower():
+            print(
+                "⚠️ Playwright browsers are not installed. Please install them by running:\n"
+                "  playwright install chromium",
+                file=sys.stderr,
+            )
+        else:
+            print(f"⚠️ Playwright rendering failed: {e}", file=sys.stderr)
+        return None
+
+
+def extract_html_content(url, html_text):
+    """Processes raw HTML text, returning filename suggestions and parsed markdown body."""
+    title = ""
+    markdown_text = None
+
+    try:
+        # Attempt semantic extraction using trafilatura
+        result = trafilatura.bare_extraction(
+            html_text,
+            output_format="markdown",
+            include_links=True,
+            include_images=True,
+            include_tables=True,
+        )
+        if result and isinstance(result, dict):
+            title = result.get("title") or ""
+            markdown_text = result.get("text")
+    except Exception as e:
+        print(
+            f"⚠️ Trafilatura extraction failed: {e}. Falling back to BeautifulSoup.",
+            file=sys.stderr,
+        )
+
+    if markdown_text:
+        if title:
+            filename = f"{clean_filename(title)}.md"
+        else:
+            soup = BeautifulSoup(html_text, "html.parser")
+            title_tag = soup.find("title")
+            if title_tag and title_tag.get_text().strip():
+                title = title_tag.get_text().strip()
+                filename = f"{clean_filename(title)}.md"
+            else:
+                filename = f"{get_fallback_filename(url)}.md"
+    else:
+        # Static fallback if trafilatura fails to parse/return body
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        title_tag = soup.find("title")
+        if title_tag and title_tag.get_text().strip():
+            title = title_tag.get_text().strip()
+        else:
+            h1_tag = soup.find("h1")
+            if h1_tag and h1_tag.get_text().strip():
+                title = h1_tag.get_text().strip()
+
+        if title:
+            filename = f"{clean_filename(title)}.md"
+        else:
+            filename = f"{get_fallback_filename(url)}.md"
+
+        for element in soup(
+            ["script", "style", "nav", "footer", "header", "noscript", "iframe"]
+        ):
+            element.decompose()
+
+        body_content = soup.find("article") or soup.find("main") or soup.body or soup
+
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_emphasis = False
+        h.body_width = 0
+
+        markdown_text = h.handle(str(body_content))
+
+    return filename, markdown_text
+
+
 def fetch_and_convert(url):
     """Fetches the target URL, detects content-type, processes text, and returns metadata + body."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
+    html_text = None
+    is_markdown = False
+    is_plain_text = False
+
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        is_markdown = "text/markdown" in content_type or url.lower().endswith(
+            (".md", ".markdown")
+        )
+        is_plain_text = "text/plain" in content_type or url.lower().endswith(
+            (".txt", ".text")
+        )
+
+        if is_markdown or is_plain_text:
+            text_content = response.text
+            filename = f"{get_fallback_filename(url)}.md"
+
+            h1_match = re.search(r"^#\s+(.+)$", text_content, re.MULTILINE)
+            if h1_match:
+                title = h1_match.group(1).strip()
+                filename = f"{clean_filename(title)}.md"
+
+            markdown_text = f"**Source:** {url}\n\n---\n\n{text_content}"
+            return filename, markdown_text
+
+        html_text = response.text
+
     except Exception as e:
-        print(f"Error fetching the URL: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"⚠️ Static fetch failed: {e}", file=sys.stderr)
+        print("⏳ Attempting direct fallback to Playwright...", file=sys.stderr)
+        html_text = fetch_with_playwright(url)
+        if not html_text:
+            sys.exit(1)
 
-    content_type = response.headers.get("Content-Type", "").lower()
+    # Clean HTML contents
+    filename, markdown_text = extract_html_content(url, html_text)
 
-    is_markdown = "text/markdown" in content_type or url.lower().endswith(
-        (".md", ".markdown")
-    )
-    is_plain_text = "text/plain" in content_type or url.lower().endswith(
-        (".txt", ".text")
-    )
+    # Evaluate if retrieved content is insufficient
+    clean_text_only = markdown_text.replace(f"**Source:** {url}\n\n---\n\n", "").strip()
 
-    if is_markdown or is_plain_text:
-        text_content = response.text
-        filename = f"{get_fallback_filename(url)}.md"
-
-        h1_match = re.search(r"^#\s+(.+)$", text_content, re.MULTILINE)
-        if h1_match:
-            title = h1_match.group(1).strip()
-            filename = f"{clean_filename(title)}.md"
-
-        markdown_text = f"**Source:** {url}\n\n---\n\n{text_content}"
-        return filename, markdown_text
-
-    # HTML flow
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    title = ""
-    title_tag = soup.find("title")
-    if title_tag and title_tag.get_text().strip():
-        title = title_tag.get_text().strip()
-    else:
-        h1_tag = soup.find("h1")
-        if h1_tag and h1_tag.get_text().strip():
-            title = h1_tag.get_text().strip()
-
-    if title:
-        filename = f"{clean_filename(title)}.md"
-    else:
-        filename = f"{get_fallback_filename(url)}.md"
-
-    for element in soup(
-        ["script", "style", "nav", "footer", "header", "noscript", "iframe"]
+    insufficient = False
+    if len(clean_text_only) < 300:
+        insufficient = True
+    elif "javascript" in clean_text_only.lower() and (
+        "enable" in clean_text_only.lower()
+        or "required" in clean_text_only.lower()
+        or "disabled" in clean_text_only.lower()
     ):
-        element.decompose()
+        insufficient = True
 
-    body_content = soup.find("article") or soup.find("main") or soup.body or soup
+    if insufficient:
+        print(
+            "⚠️ Extracted content is short or suggests dynamic JS is required. Trying Playwright fallback..."
+        )
+        dynamic_html = fetch_with_playwright(url)
+        if dynamic_html:
+            filename, markdown_text = extract_html_content(url, dynamic_html)
 
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
-    h.ignore_emphasis = False
-    h.body_width = 0
-
-    markdown_text = h.handle(str(body_content))
     markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text)
-
-    markdown_text = f"**Source:** {url}\n\n---\n\n" + markdown_text
+    markdown_text = f"**Source:** {url}\n\n---\n\n" + markdown_text.replace(
+        f"**Source:** {url}\n\n---\n\n", ""
+    )
     return filename, markdown_text
 
 
