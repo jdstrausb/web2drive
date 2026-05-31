@@ -2,6 +2,7 @@
 import os
 import sys
 import re
+import json
 import tempfile
 import urllib.parse
 import requests
@@ -25,6 +26,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 CONFIG_DIR = os.path.expanduser("~/.config/web2drive")
 CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "token.json")
+COOKIES_PATH = os.path.join(CONFIG_DIR, "cookies.json")
 
 
 def print_help():
@@ -154,6 +156,68 @@ def generate_llm_filename(url, markdown_content):
         return None
 
 
+def load_session_cookies():
+    """Loads saved authentication cookies from the configuration directory."""
+    if not os.path.exists(COOKIES_PATH):
+        return None
+    try:
+        with open(COOKIES_PATH, "r") as f:
+            cookies = json.load(f)
+            if isinstance(cookies, list):
+                return cookies
+    except Exception as e:
+        print(f"⚠️ Warning: Could not parse {COOKIES_PATH}: {e}", file=sys.stderr)
+    return None
+
+
+def apply_cookies_to_requests(session, cookies_list):
+    """Binds loaded JSON cookies to a requests.Session object."""
+    for cookie in cookies_list:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name is not None and value is not None:
+            session.cookies.set(
+                name=name,
+                value=value,
+                domain=cookie.get("domain", ""),
+                path=cookie.get("path", "/"),
+                secure=cookie.get("secure", False),
+            )
+
+
+def clean_page_overlays(page):
+    """Injects a client-side JS script to remove banners, modals, and paywalls."""
+    js_cleanup_script = """
+    () => {
+        const selectors = [
+            '[id*="consent"]', '[class*="consent"]',
+            '[id*="cookie"]', '[class*="cookie"]',
+            '[class*="paywall"]', '[id*="paywall"]',
+            '[class*="overlay"]', '[class*="modal"]',
+            '.tp-modal', '.tp-backdrop'
+        ];
+        
+        selectors.forEach(selector => {
+            try {
+                document.querySelectorAll(selector).forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' || style.position === 'absolute' || parseInt(style.zIndex) > 99) {
+                        el.remove();
+                    }
+                });
+            } catch (e) {}
+        });
+
+        document.body.style.setProperty('overflow', 'auto', 'important');
+        document.documentElement.style.setProperty('overflow', 'auto', 'important');
+    }
+    """
+    try:
+        page.evaluate(js_cleanup_script)
+    except Exception as e:
+        print(f"⚠️ Warning: Overlay cleanup failed: {e}", file=sys.stderr)
+
+
 def fetch_with_playwright(url):
     """Fallback fetcher using headless Playwright to handle JavaScript-heavy SPAs."""
     try:
@@ -173,13 +237,23 @@ def fetch_with_playwright(url):
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
             )
+
+            # Authenticate context if cookies exist
+            cookies = load_session_cookies()
+            if cookies:
+                print("🔑 Injecting authentication cookies into Playwright context...")
+                context.add_cookies(cookies)
+
             page = context.new_page()
 
             # Navigate and wait for network to be idle to ensure SPA is loaded
             page.goto(url, wait_until="networkidle", timeout=25000)
 
+            # Dismiss blocking overlays before reading DOM content
+            clean_page_overlays(page)
+
             # Allow additional time for frameworks to finish layout hydration
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1000)
 
             html_content = page.content()
             browser.close()
@@ -267,16 +341,25 @@ def extract_html_content(url, html_text):
 
 def fetch_and_convert(url):
     """Fetches the target URL, detects content-type, processes text, and returns metadata + body."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    }
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+    )
+
+    # Authenticate static session if cookies exist
+    cookies = load_session_cookies()
+    if cookies:
+        print("🔑 Applying authentication cookies to static request...")
+        apply_cookies_to_requests(session, cookies)
 
     html_text = None
     is_markdown = False
     is_plain_text = False
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = session.get(url, timeout=15)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "").lower()

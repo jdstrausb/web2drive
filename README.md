@@ -6,10 +6,11 @@ This utility is designed for rapid delivery of clean context files (like referen
 
 ## Features
 
-- **Content extraction**: Automatically parses HTML to strip boilerplate elements (like navigation headers, scripts, styles, and footers), returning only the core content.
-- **Format-aware parsing**: Automatically detects raw Markdown or plain text URLs (like raw GitHub sources) and passes them through without double-parsing.
+- **Content extraction**: Uses `trafilatura`'s advanced semantic extraction algorithms to isolate core page content and discard layout noise (such as navigation bars, sidebars, and footers).
+- **Client-Side SPA Support**: Automatically falls back to a headless browser running `Playwright` if standard retrieval processes return empty pages, loading indicators, or JavaScript requirements.
+- **Session Authentication**: Supports importing active browser sessions to parse articles behind personal accounts, subscription models, or basic paywalls.
+- **Overlay & Cookie Banner Removal**: Injects structural cleanup routines during headless rendering to strip cookie consent banners and intrusive modal overlays.
 - **LLM-assisted naming**: Uses `gemini-3.1-flash-lite` to analyze the URL and document content to generate a clean, highly descriptive, and concise filename.
-- **Google Drive isolation**: Organizes documents inside a dedicated `Web2Drive` directory in Google Drive.
 - **Zero local clutter**: Runs completely via temporary system files that are automatically deleted immediately after a successful upload.
 
 ## Prerequisites
@@ -26,22 +27,71 @@ This utility is designed for rapid delivery of clean context files (like referen
    cd ~/Documents/scripts/python/web2drive
    ```
 
-2. Setup the isolated Python virtual environment and install the required dependencies using `uv` (or standard `pip`):
+2. Setup the isolated Python virtual environment and install the required dependencies:
 
    ```bash
    python3 -m venv venv
    source venv/bin/activate
-   uv pip install -r requirements.txt
+   pip install -r requirements.txt
    ```
 
-3. Ensure your Google OAuth credentials are saved in the default configuration path:
+3. Initialize Playwright system dependencies:
+
+   ```bash
+   playwright install chromium
+   ```
+
+4. Ensure your Google OAuth credentials are saved in the default configuration path:
    ```bash
    ~/.config/web2drive/credentials.json
    ```
 
-## macOS Terminal Integration
+## Session Authentication & Cookie Bypass
 
-To run `web2drive` natively from anywhere in your terminal, add the following shell function to your `~/.foorc` file (`~/.zshrc`, `~/.bashrc`):
+To parse paywalled content, subscription-only portals, or bypass restrictive cookie-consent walls, you can provide active session cookies to Web2Drive. The utility will automatically apply these credentials to both static HTTP requests and dynamic Playwright sessions.
+
+### End-to-End Setup Guide
+
+1. **Install a Cookie Export Extension**:
+   Install a web browser extension capable of exporting cookies in JSON format.
+   - Recommended Chrome/Firefox extensions: _EditThisCookie_ or _Cookie-Editor_.
+
+2. **Log In to the Target Site**:
+   Navigate to the website in your browser (e.g., a subscription service or a site requiring a login) and ensure you are logged in with an active session.
+
+3. **Export Cookies to JSON**:
+   - Click your cookie extension icon.
+   - Select the **Export** option.
+   - Ensure the export format is configured as **JSON**.
+
+4. **Save to the Configuration Path**:
+   Create or open your local `cookies.json` configuration file:
+
+   ```bash
+   mkdir -p ~/.config/web2drive
+   nano ~/.config/web2drive/cookies.json
+   ```
+
+   Paste the exported JSON data directly into this file and save it. The format should structurally look like a list of browser cookies:
+
+   ```json
+   [
+     {
+       "domain": ".example.com",
+       "expirationDate": 1799999999,
+       "name": "session_token",
+       "path": "/",
+       "value": "your-active-session-value-here"
+     }
+   ]
+   ```
+
+5. **Run the Scraper**:
+   Execute the `web2drive` command as normal. The script will automatically discover the file, log a message acknowledging the cookie injection (`🔑 Applying authentication cookies...`), and use your authenticated session to fetch the page.
+
+## Terminal Integration
+
+To run `web2drive` natively from anywhere in your terminal, add the following shell function to your `~/.zshrc` (or standard `~/.bashrc`):
 
 ```bash
 # Extract web page and upload to Google Drive as Markdown
@@ -84,7 +134,7 @@ web2drive "https://raw.githubusercontent.com/googleapis/python-genai/refs/heads/
 
 ### Initial Run Authentication
 
-On your first execution, the script will open your system's default browser window to authorize access to your Google Drive space. The authorization token will be safely stored in `~/.config/web2drive/token.json` so you don't need to repeat this step on future runs.
+On your first execution, the script will open your system's default browser window to authorize access to your Google Drive space. The authorization token will be safely stored in `~/.config/web2drive/token.json` so you do not need to repeat this step on future runs.
 
 ## License
 
