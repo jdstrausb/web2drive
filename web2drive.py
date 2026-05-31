@@ -20,6 +20,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.http import MediaFileUpload
 
+from pydantic import BaseModel, Field
+from typing import List
+
 # Scopes required to upload files the script creates
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
@@ -98,62 +101,90 @@ def get_fallback_filename(url):
     return "webpage_content"
 
 
-def generate_llm_filename(url, markdown_content):
-    """Uses the modern google-genai SDK to generate a highly descriptive, clean filename."""
+# Define the structure we want the LLM to return
+class PageMetadata(BaseModel):
+    filename: str = Field(
+        description="A clean, highly descriptive, and concise filename ending in '.md'. "
+        "Use only letters, numbers, underscores, and hyphens (no spaces). "
+        "Do not exceed 60 characters in total."
+    )
+    summary: str = Field(
+        description="A concise, 3-sentence executive summary of the core content."
+    )
+    tags: List[str] = Field(
+        description="A list of 3 to 5 highly relevant keywords or category tags."
+    )
+    reading_time: int = Field(
+        description="Estimated reading time in minutes based on document length and complexity."
+    )
+
+
+def generate_metadata_and_filename(url, markdown_content):
+    """
+    Uses gemini-3.1-flash-lite to analyze the content and return a structured
+    metadata block and a descriptive filename in a single API call.
+    """
     api_key = os.environ.get("WEB2DRIVE_GEMINI_API_KEY")
     if not api_key:
-        return None
+        return None, None
 
     try:
-        # Initialize client with modern SDK structure
         client = genai.Client(api_key=api_key)
-
-        # Truncate content to 6000 characters to keep context window small and fast
-        content_sample = markdown_content[:6000]
+        content_sample = markdown_content[
+            :8000
+        ]  # Slightly larger context sample for better summaries
 
         prompt = (
-            "You are a file-naming utility. Your job is to analyze a source URL and a "
-            "sample of its parsed markdown content to generate a clean, highly descriptive, "
-            "and concise filename.\n\n"
-            "Requirements:\n"
-            "- The filename must end with the '.md' extension.\n"
-            "- Use only letters, numbers, underscores, and hyphens. Avoid spaces or other special characters.\n"
-            "- It must be concise and descriptive (typically 3 to 6 words).\n"
-            "- Do not exceed 60 characters in total.\n"
-            "- Output ONLY the final filename. Do not include quotes, markdown formatting, code blocks, or explanations.\n\n"
-            f"URL: {url}\n\n"
-            f"Content Sample:\n{content_sample}"
+            "You are an expert document archivist. Analyze the following URL and content sample "
+            "to extract a structured metadata profile and determine a clean, professional filename."
         )
 
-        # Invoke modern client generation on gemini-3.1-flash-lite
+        # Call gemini-3.1-flash-lite with structured JSON output configurations
         response = client.models.generate_content(
-            model="gemini-3.1-flash-lite", contents=prompt
+            model="gemini-3.1-flash-lite",
+            contents=[prompt, f"URL: {url}", f"Content Sample:\n{content_sample}"],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=PageMetadata,
+                temperature=0.2,  # Lower temperature for more consistent, factual extraction
+            ),
         )
 
-        # Safe extraction of text output to satisfy static type checkers
-        raw_text = response.text
-        if not raw_text:
-            return None
+        if not response.text:
+            return None, None
 
-        filename = raw_text.strip()
+        # Parse the reliable JSON response
+        data = json.loads(response.text)
 
-        # Clean up any unexpected markdown formatting returned by the LLM
-        filename = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", filename).strip()
-        filename = filename.replace('"', "").replace("'", "")
+        # Format the metadata block to prepend to the Markdown document
+        tags_line = ", ".join(
+            [f"`#{tag.strip().replace(' ', '')}`" for tag in data.get("tags", [])]
+        )
+        metadata_header = (
+            f"---\n"
+            f"**Source:** {url}\n"
+            f"**Estimated Reading Time:** {data.get('reading_time', 1)} mins\n"
+            f"**Tags:** {tags_line}\n"
+            f"---\n\n"
+            f"### Executive Summary\n"
+            f"{data.get('summary', '')}\n\n"
+            f"---\n\n"
+        )
 
+        filename = data.get("filename", "")
+        # Fallback validation to ensure filename is safe
         if not filename.lower().endswith(".md"):
             filename += ".md"
-
-        # Basic sanitization fallback to guarantee file safety
         filename = re.sub(r'[\\/*?:"<>|\s]', "_", filename)
 
-        return filename
+        return filename, metadata_header
+
     except Exception as e:
         print(
-            f"⚠️ LLM naming failed: {e}. Falling back to default naming.",
+            f"⚠️ LLM metadata generation failed: {e}. Falling back to default naming.",
             file=sys.stderr,
         )
-        return None
+        return None, None
 
 
 def load_session_cookies():
@@ -479,16 +510,27 @@ def main():
     print(f"⏳ Extracting content from: {url}...")
     filename, markdown_content = fetch_and_convert(url)
 
-    # Attempt to improve the filename using Gemini with the modern SDK
-    llm_filename = generate_llm_filename(url, markdown_content)
-    if llm_filename:
+    # Clean standard source line if we are going to use the custom structured header
+    clean_content_body = markdown_content.replace(f"**Source:** {url}\n\n---\n\n", "")
+
+    # Retrieve filename and structured metadata from Gemini
+    llm_filename, metadata_header = generate_metadata_and_filename(
+        url, clean_content_body
+    )
+
+    if llm_filename and metadata_header:
         filename = llm_filename
+        # Combine the custom header with the cleaned body
+        final_document = metadata_header + clean_content_body
+    else:
+        # Fallback to the original structure if the LLM call failed
+        final_document = markdown_content
 
     temp_file = tempfile.NamedTemporaryFile(
         mode="w+", suffix=".md", delete=False, encoding="utf-8"
     )
     try:
-        temp_file.write(markdown_content)
+        temp_file.write(final_document)
         temp_file.close()
 
         print(f"⏳ Uploading to Google Drive as '{filename}'...")
