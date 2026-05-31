@@ -6,6 +6,7 @@ import json
 import tempfile
 import urllib.parse
 import subprocess
+import time
 import requests
 from bs4 import BeautifulSoup
 import html2text
@@ -55,18 +56,20 @@ def print_help():
     """Prints usage documentation for the CLI utility."""
     help_text = """Web2Drive Utility
 -----------------
-Fetches the content of a URL or reads from the system clipboard, 
-cleans up non-essential structural elements, and uploads the parsed 
-Markdown file directly to a dedicated 'Web2Drive' folder in Google Drive.
+Fetches the content of a URL, reads from the system clipboard, or batch-processes
+a list of URLs from a local text file, cleans and formats the content, and uploads
+the resulting Markdown files directly to a dedicated 'Web2Drive' folder in Google Drive.
 
 Usage:
   web2drive <URL>
   web2drive --clip | -c
+  web2drive --batch | -b <path_to_file.txt>
   web2drive --help | -h
 
 Options:
-  -c, --clip    Parse and upload content directly from the system clipboard.
-  -h, --help    Show this usage documentation.
+  -c, --clip     Parse and upload content directly from the system clipboard.
+  -b, --batch    Batch-process a list of URLs from a local text file (one URL per line).
+  -h, --help     Show this usage documentation.
 """
     print(help_text)
 
@@ -607,39 +610,73 @@ def upload_to_drive(local_file_path, drive_filename):
         sys.exit(1)
 
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
-        print_help()
-        sys.exit(0)
-
-    # Determine execution source
-    use_clipboard = sys.argv[1] in ("-c", "--clip")
-
-    if use_clipboard:
-        print("⏳ Reading content from system clipboard...")
-        raw_content = get_clipboard_content()
-        if not raw_content or not raw_content.strip():
-            print("❌ Error: Clipboard is empty or could not be read.", file=sys.stderr)
-            sys.exit(1)
-
-        url = "Clipboard"
-
-        if is_html_string(raw_content):
-            print(
-                "⏳ Detected HTML structure in clipboard. Extracting main content body..."
-            )
-            filename, markdown_content = extract_html_content(url, raw_content)
-        else:
-            print("⏳ Detected plain text/Markdown structure in clipboard.")
-            filename = "clipboard_content.md"
-            h1_match = re.search(r"^#\s+(.+)$", raw_content, re.MULTILINE)
-            if h1_match:
-                filename = f"{clean_filename(h1_match.group(1).strip())}.md"
-            markdown_content = raw_content
-    else:
-        url = sys.argv[1]
-        print(f"⏳ Extracting content from: {url}...")
+def process_single_url(url):
+    """Fetches, converts, summarizes, and uploads a single URL to Google Drive."""
+    try:
         filename, markdown_content = fetch_and_convert(url)
+
+        # Clean standard fallback source line to prevent duplication
+        clean_content_body = markdown_content.replace(
+            f"**Source:** {url}\n\n---\n\n", ""
+        )
+
+        # Retrieve filename and structured metadata from Gemini
+        llm_filename, metadata_header = generate_metadata_and_filename(
+            url, clean_content_body
+        )
+
+        if llm_filename and metadata_header:
+            filename = llm_filename
+            final_document = metadata_header + clean_content_body
+        else:
+            final_document = markdown_content
+
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".md", delete=False, encoding="utf-8"
+        )
+        try:
+            temp_file.write(final_document)
+            temp_file.close()
+
+            print(f"⏳ Uploading to Google Drive as '{filename}'...")
+            upload_to_drive(temp_file.name, filename)
+        finally:
+            if os.path.exists(temp_file.name):
+                try:
+                    os.remove(temp_file.name)
+                except Exception as e:
+                    print(
+                        f"Warning: Could not remove temporary file {temp_file.name}: {e}",
+                        file=sys.stderr,
+                    )
+        return True
+    except Exception as e:
+        print(f"❌ Error processing {url}: {e}", file=sys.stderr)
+        return False
+
+
+def process_clipboard():
+    """Parses system clipboard content and uploads it directly to Google Drive."""
+    print("⏳ Reading content from system clipboard...")
+    raw_content = get_clipboard_content()
+    if not raw_content or not raw_content.strip():
+        print("❌ Error: Clipboard is empty or could not be read.", file=sys.stderr)
+        sys.exit(1)
+
+    url = "Clipboard"
+
+    if is_html_string(raw_content):
+        print(
+            "⏳ Detected HTML structure in clipboard. Extracting main content body..."
+        )
+        filename, markdown_content = extract_html_content(url, raw_content)
+    else:
+        print("⏳ Detected plain text/Markdown structure in clipboard.")
+        filename = "clipboard_content.md"
+        h1_match = re.search(r"^#\s+(.+)$", raw_content, re.MULTILINE)
+        if h1_match:
+            filename = f"{clean_filename(h1_match.group(1).strip())}.md"
+        markdown_content = raw_content
 
     # Clean standard fallback source line to prevent duplication
     clean_content_body = markdown_content.replace(f"**Source:** {url}\n\n---\n\n", "")
@@ -673,6 +710,98 @@ def main():
                     f"Warning: Could not remove temporary file {temp_file.name}: {e}",
                     file=sys.stderr,
                 )
+
+
+def run_batch(file_path):
+    """Reads a file of URLs and sequentially processes each one."""
+    if not os.path.exists(file_path):
+        print(f"❌ Error: File not found at '{file_path}'", file=sys.stderr)
+        sys.exit(1)
+
+    urls = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith(("http://", "https://")):
+                    urls.append(line)
+                else:
+                    print(
+                        f"⚠️ Warning: Skipping invalid URL line: '{line}'",
+                        file=sys.stderr,
+                    )
+    except Exception as e:
+        print(f"❌ Error reading batch file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not urls:
+        print("⚠️ Warning: No valid URLs found in the batch file.", file=sys.stderr)
+        sys.exit(0)
+
+    total_urls = len(urls)
+    print(f"🚀 Found {total_urls} valid URLs to process in batch mode.")
+
+    successful_uploads = 0
+    for index, url in enumerate(urls, 1):
+        print(f"\n────────────────────────────────────────")
+        print(f"📦 [{index}/{total_urls}] Processing: {url}")
+        print(f"────────────────────────────────────────")
+        success = process_single_url(url)
+        if success:
+            successful_uploads += 1
+
+        # Defensive pacing sleep to avoid rate limiting
+        if index < total_urls:
+            time.sleep(2)
+
+    print(
+        f"\n✨ Batch processing completed. Successfully uploaded {successful_uploads}/{total_urls} files."
+    )
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print_help()
+        sys.exit(0)
+
+    first_arg = sys.argv[1]
+
+    # Mode Dispatching
+    if first_arg in ("-c", "--clip"):
+        process_clipboard()
+
+    elif first_arg in ("-b", "--batch"):
+        if len(sys.argv) < 3:
+            print(
+                "❌ Error: Please provide the path to a text file containing URLs.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        file_path = sys.argv[2]
+        run_batch(file_path)
+
+    else:
+        # Standard input processing
+        url = first_arg
+        if not url.startswith(("http://", "https://")):
+            # Auto-detect local .txt text file as an implicit batch option
+            if os.path.exists(url) and url.endswith(".txt"):
+                print(
+                    f"💡 Detected a local text file. Processing '{url}' in batch mode..."
+                )
+                run_batch(url)
+            else:
+                print(
+                    f"❌ Error: Invalid URL, text file path, or flag: '{url}'",
+                    file=sys.stderr,
+                )
+                print_help()
+                sys.exit(1)
+        else:
+            print(f"⏳ Extracting content from: {url}...")
+            process_single_url(url)
 
 
 if __name__ == "__main__":
