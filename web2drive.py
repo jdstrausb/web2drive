@@ -7,20 +7,24 @@ import tempfile
 import urllib.parse
 import subprocess
 import time
+
 import requests
 from bs4 import BeautifulSoup
 import html2text
 import trafilatura
+from pydantic import BaseModel, Field
 
-# Import the modern Google Gen AI SDK
+# Modern Google Gen AI SDK
 from google import genai
-from google.genai import types
 
-# Restored legacy Google API & OAuth imports for Google Drive API interaction
+# Google API & OAuth imports for Google Drive interaction
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+# --- Configuration paths -----------------------------------------------------
 
 # Scopes required to upload files the script creates
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
@@ -30,9 +34,46 @@ CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "token.json")
 COOKIES_PATH = os.path.join(CONFIG_DIR, "cookies.json")
 
-# Import Pydantic for structured validation
-from pydantic import BaseModel, Field
-from typing import List
+# --- Behavioural constants ---------------------------------------------------
+
+DRIVE_FOLDER_NAME = "Web2Drive"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+# Gemini metadata generation
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+LLM_TEMPERATURE = 0.2
+LLM_CONTENT_SAMPLE_CHARS = 8000
+
+# Fetch / rendering
+STATIC_FETCH_TIMEOUT = 15  # seconds, for the requests static fetch
+PLAYWRIGHT_TIMEOUT_MS = 25000  # ms, for page.goto
+PLAYWRIGHT_SETTLE_MS = 1000  # ms, post-load settle before reading content
+
+# Content-sufficiency heuristics (measured in chars of extracted body)
+MIN_CONTENT_CHARS = 400  # below this, treat extraction as failed
+SHORT_CONTENT_CHARS = 1500  # below this, inspect for "JS required" hints
+
+# Batch pacing
+BATCH_SLEEP_SECONDS = 2
+
+# Document assembly. Kept in one place so the header format can never drift
+# between the producer and any consumer.
+SOURCE_HEADER_TEMPLATE = "**Source:** {url}\n\n---\n\n"
+
+
+def format_source_header(url: str) -> str:
+    """Returns the minimal source header prepended when no LLM metadata exists."""
+    return SOURCE_HEADER_TEMPLATE.format(url=url)
+
+
+class Web2DriveError(Exception):
+    """Raised for expected, user-facing failures in the processing pipeline.
+
+    Library-level functions raise this instead of calling sys.exit, so that
+    callers (single-URL, clipboard, batch) can decide whether a failure is
+    fatal or merely skippable. Using a normal Exception subclass also means
+    these are caught by the per-URL handler in batch mode, unlike SystemExit.
+    """
 
 
 class PageMetadata(BaseModel):
@@ -44,7 +85,7 @@ class PageMetadata(BaseModel):
     summary: str = Field(
         description="A concise, 3-sentence executive summary of the core content."
     )
-    tags: List[str] = Field(
+    tags: list[str] = Field(
         description="A list of 3 to 5 highly relevant keywords or category tags."
     )
     reading_time: int = Field(
@@ -52,7 +93,7 @@ class PageMetadata(BaseModel):
     )
 
 
-def print_help():
+def print_help() -> None:
     """Prints usage documentation for the CLI utility."""
     help_text = """Web2Drive Utility
 -----------------
@@ -75,7 +116,10 @@ Options:
 
 
 def get_gdrive_service():
-    """Authenticates the user and returns the Drive API service."""
+    """Authenticates the user and returns the Drive API service.
+
+    Raises Web2DriveError if the OAuth client credentials are missing.
+    """
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -85,11 +129,7 @@ def get_gdrive_service():
             creds.refresh(Request())
         else:
             if not os.path.exists(CREDENTIALS_PATH):
-                print(
-                    f"Error: Missing credentials file at {CREDENTIALS_PATH}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                raise Web2DriveError(f"Missing credentials file at {CREDENTIALS_PATH}")
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
 
@@ -97,19 +137,17 @@ def get_gdrive_service():
         with open(TOKEN_PATH, "w") as token:
             token.write(creds.to_json())
 
-    from googleapiclient.discovery import build
-
     return build("drive", "v3", credentials=creds)
 
 
-def clean_filename(title):
+def clean_filename(title: str) -> str:
     """Sanitizes text to make it a safe, readable filename."""
     safe = re.sub(r'[\\/*?:"<>|]', "", title)
     safe = re.sub(r"\s+", " ", safe).strip()
     return safe[:60]
 
 
-def get_fallback_filename(url):
+def get_fallback_filename(url: str) -> str:
     """Extracts a filename fallback from the URL path segments."""
     parsed_url = urllib.parse.urlparse(url)
     path_segments = [seg for seg in parsed_url.path.split("/") if seg]
@@ -123,44 +161,22 @@ def get_fallback_filename(url):
     return "webpage_content"
 
 
-def get_clipboard_content():
+def get_clipboard_content() -> str | None:
     """Reads content from the system clipboard across platforms using subprocess."""
-    # Try macOS (pbpaste)
-    try:
-        result = subprocess.run(["pbpaste"], capture_output=True, text=True, check=True)
-        return result.stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+    # Each candidate is (command, args). The first available utility wins.
+    clipboard_commands = [
+        ["pbpaste"],  # macOS
+        ["xclip", "-selection", "clipboard", "-o"],  # Linux (X11)
+        ["xsel", "-b", "-o"],  # Linux (X11)
+        ["wl-paste"],  # Linux (Wayland)
+    ]
 
-    # Try Linux (xclip)
-    try:
-        result = subprocess.run(
-            ["xclip", "-selection", "clipboard", "-o"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
-
-    # Try Linux (xsel)
-    try:
-        result = subprocess.run(
-            ["xsel", "-b", "-o"], capture_output=True, text=True, check=True
-        )
-        return result.stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
-
-    # Try Wayland (wl-paste)
-    try:
-        result = subprocess.run(
-            ["wl-paste"], capture_output=True, text=True, check=True
-        )
-        return result.stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+    for command in clipboard_commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            return result.stdout
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
 
     print(
         "❌ Error: No supported clipboard utility found (pbpaste, xclip, xsel, wl-paste).",
@@ -169,13 +185,14 @@ def get_clipboard_content():
     return None
 
 
-def is_html_string(text):
+def is_html_string(text: str) -> bool:
     """Heuristic check to identify if a block of text contains rich HTML code."""
     cleaned_start = text.strip()[:150].lower()
     if cleaned_start.startswith("<!doctype") or cleaned_start.startswith("<html"):
         return True
 
-    # Track standard structural blocks to differentiate from code blocks containing stray tags
+    # Count standard structural blocks to differentiate from code blocks
+    # that merely contain stray tags.
     tags = [
         "<div",
         "<p>",
@@ -193,10 +210,14 @@ def is_html_string(text):
     return match_count >= 3
 
 
-def generate_metadata_and_filename(url, markdown_content):
-    """
-    Uses gemini-3.1-flash-lite to analyze the content and return a structured
-    metadata block and a descriptive filename in a single API call.
+def generate_metadata_and_filename(
+    url: str, markdown_content: str
+) -> tuple[str | None, str | None]:
+    """Uses Gemini to derive a descriptive filename and a structured metadata header.
+
+    Returns (filename, metadata_header) on success, or (None, None) if the API
+    key is absent or the call fails. This is best-effort: callers fall back to
+    deterministic naming when it returns None.
     """
     api_key = os.environ.get("WEB2DRIVE_GEMINI_API_KEY")
     if not api_key:
@@ -204,7 +225,7 @@ def generate_metadata_and_filename(url, markdown_content):
 
     try:
         client = genai.Client(api_key=api_key)
-        content_sample = markdown_content[:8000]
+        content_sample = markdown_content[:LLM_CONTENT_SAMPLE_CHARS]
 
         prompt = (
             "You are an expert document archivist. Analyze the following URL and content sample "
@@ -212,12 +233,12 @@ def generate_metadata_and_filename(url, markdown_content):
         )
 
         response = client.models.generate_content(
-            model="gemini-3.1-flash-lite",
+            model=GEMINI_MODEL,
             contents=[prompt, f"URL: {url}", f"Content Sample:\n{content_sample}"],
             config={
                 "response_mime_type": "application/json",
                 "response_json_schema": PageMetadata.model_json_schema(),
-                "temperature": 0.2,
+                "temperature": LLM_TEMPERATURE,
             },
         )
 
@@ -227,18 +248,18 @@ def generate_metadata_and_filename(url, markdown_content):
         data = json.loads(response.text)
 
         tags_line = ", ".join(
-            [f"`#{tag.strip().replace(' ', '')}`" for tag in data.get("tags", [])]
+            f"`#{tag.strip().replace(' ', '')}`" for tag in data.get("tags", [])
         )
 
         metadata_header = (
-            f"---\n"
+            "---\n"
             f"**Source:** {url}\n"
             f"**Estimated Reading Time:** {data.get('reading_time', 1)} mins\n"
             f"**Tags:** {tags_line}\n"
-            f"---\n\n"
-            f"### Executive Summary\n"
+            "---\n\n"
+            "### Executive Summary\n"
             f"{data.get('summary', '')}\n\n"
-            f"---\n\n"
+            "---\n\n"
         )
 
         filename = data.get("filename", "")
@@ -256,7 +277,7 @@ def generate_metadata_and_filename(url, markdown_content):
         return None, None
 
 
-def load_session_cookies():
+def load_session_cookies() -> list | None:
     """Loads saved authentication cookies from the configuration directory."""
     if not os.path.exists(COOKIES_PATH):
         return None
@@ -270,7 +291,7 @@ def load_session_cookies():
     return None
 
 
-def apply_cookies_to_requests(session, cookies_list):
+def apply_cookies_to_requests(session: requests.Session, cookies_list: list) -> None:
     """Binds loaded JSON cookies to a requests.Session object."""
     for cookie in cookies_list:
         name = cookie.get("name")
@@ -285,7 +306,7 @@ def apply_cookies_to_requests(session, cookies_list):
             )
 
 
-def clean_page_overlays(page):
+def clean_page_overlays(page) -> None:
     """Injects a client-side JS script to remove banners, modals, and paywalls."""
     js_cleanup_script = """
     () => {
@@ -296,7 +317,7 @@ def clean_page_overlays(page):
             '[class*="overlay"]', '[class*="modal"]',
             '.tp-modal', '.tp-backdrop'
         ];
-        
+
         selectors.forEach(selector => {
             try {
                 document.querySelectorAll(selector).forEach(el => {
@@ -318,7 +339,7 @@ def clean_page_overlays(page):
         print(f"⚠️ Warning: Overlay cleanup failed: {e}", file=sys.stderr)
 
 
-def fetch_with_playwright(url):
+def fetch_with_playwright(url: str) -> str | None:
     """Fallback fetcher using headless Playwright to handle JavaScript-heavy SPAs."""
     try:
         from playwright.sync_api import sync_playwright
@@ -334,9 +355,7 @@ def fetch_with_playwright(url):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            )
+            context = browser.new_context(user_agent=USER_AGENT)
 
             cookies = load_session_cookies()
             if cookies:
@@ -344,9 +363,9 @@ def fetch_with_playwright(url):
                 context.add_cookies(cookies)
 
             page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=25000)
+            page.goto(url, wait_until="networkidle", timeout=PLAYWRIGHT_TIMEOUT_MS)
             clean_page_overlays(page)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(PLAYWRIGHT_SETTLE_MS)
 
             html_content = page.content()
             browser.close()
@@ -363,11 +382,8 @@ def fetch_with_playwright(url):
         return None
 
 
-def pre_clean_html(html_text):
-    """
-    Decomposes comment lists, sidebars, related items, headers, footers,
-    and general layout noise to ensure only the core text is processed.
-    """
+def pre_clean_html(html_text: str) -> str:
+    """Strips layout noise (nav, sidebars, comments, widgets) before extraction."""
     soup = BeautifulSoup(html_text, "html.parser")
 
     noise_selectors = [
@@ -419,8 +435,12 @@ def pre_clean_html(html_text):
     return str(soup)
 
 
-def extract_html_content(url, html_text):
-    """Processes raw HTML text, returning filename suggestions and parsed markdown body."""
+def extract_html_content(url: str, html_text: str) -> tuple[str, str]:
+    """Processes raw HTML, returning a (filename, markdown_body) pair.
+
+    The returned body never includes a source header; assembly of the final
+    document happens in build_and_upload.
+    """
     cleaned_html = pre_clean_html(html_text)
 
     title = ""
@@ -483,14 +503,15 @@ def extract_html_content(url, html_text):
     return filename, markdown_text
 
 
-def fetch_and_convert(url):
-    """Fetches the target URL, detects content-type, processes text, and returns metadata + body."""
+def fetch_and_convert(url: str) -> tuple[str, str]:
+    """Fetches the URL, detects content-type, and returns a (filename, body) pair.
+
+    The body is clean Markdown with no source header attached. Raises
+    Web2DriveError if neither the static request nor the Playwright fallback
+    can retrieve the page.
+    """
     session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        }
-    )
+    session.headers.update({"User-Agent": USER_AGENT})
 
     cookies = load_session_cookies()
     if cookies:
@@ -498,11 +519,9 @@ def fetch_and_convert(url):
         apply_cookies_to_requests(session, cookies)
 
     html_text = None
-    is_markdown = False
-    is_plain_text = False
 
     try:
-        response = session.get(url, timeout=15)
+        response = session.get(url, timeout=STATIC_FETCH_TIMEOUT)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "").lower()
@@ -522,8 +541,7 @@ def fetch_and_convert(url):
                 title = h1_match.group(1).strip()
                 filename = f"{clean_filename(title)}.md"
 
-            markdown_text = f"**Source:** {url}\n\n---\n\n{text_content}"
-            return filename, markdown_text
+            return filename, text_content
 
         html_text = response.text
 
@@ -532,39 +550,45 @@ def fetch_and_convert(url):
         print("⏳ Attempting direct fallback to Playwright...", file=sys.stderr)
         html_text = fetch_with_playwright(url)
         if not html_text:
-            sys.exit(1)
+            raise Web2DriveError(
+                f"Could not fetch '{url}': static request and Playwright both failed."
+            ) from e
 
     filename, markdown_text = extract_html_content(url, html_text)
 
-    clean_text_only = markdown_text.replace(f"**Source:** {url}\n\n---\n\n", "").strip()
-
+    clean_text = markdown_text.strip()
     insufficient = False
-    if len(clean_text_only) < 400:
+    if len(clean_text) < MIN_CONTENT_CHARS:
         insufficient = True
-    elif len(clean_text_only) < 1500:
-        if "javascript" in clean_text_only.lower() and any(
-            x in clean_text_only.lower() for x in ["enable", "required", "disabled"]
+    elif len(clean_text) < SHORT_CONTENT_CHARS:
+        lowered = clean_text.lower()
+        if "javascript" in lowered and any(
+            x in lowered for x in ("enable", "required", "disabled")
         ):
             insufficient = True
 
     if insufficient:
         print(
-            "⚠️ Extracted content is short or suggests dynamic JS is required. Trying Playwright fallback..."
+            "⚠️ Extracted content is short or suggests dynamic JS is required. "
+            "Trying Playwright fallback..."
         )
         dynamic_html = fetch_with_playwright(url)
         if dynamic_html:
             filename, markdown_text = extract_html_content(url, dynamic_html)
 
     markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text)
-    markdown_text = f"**Source:** {url}\n\n---\n\n" + markdown_text.replace(
-        f"**Source:** {url}\n\n---\n\n", ""
-    )
     return filename, markdown_text
 
 
-def get_or_create_folder(service, folder_name="Web2Drive"):
-    """Finds or creates a dedicated directory inside Google Drive."""
-    query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
+def get_or_create_folder(service, folder_name: str = DRIVE_FOLDER_NAME) -> str:
+    """Finds or creates a dedicated directory inside Google Drive.
+
+    Raises Web2DriveError if the Drive API call fails.
+    """
+    query = (
+        "mimeType = 'application/vnd.google-apps.folder' "
+        f"and name = '{folder_name}' and trashed = false"
+    )
     try:
         results = service.files().list(q=query, fields="files(id, name)").execute()
         files = results.get("files", [])
@@ -580,14 +604,16 @@ def get_or_create_folder(service, folder_name="Web2Drive"):
         folder = service.files().create(body=folder_metadata, fields="id").execute()
         return folder["id"]
     except Exception as e:
-        print(f"Error resolving Google Drive folder: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise Web2DriveError(f"Error resolving Google Drive folder: {e}") from e
 
 
-def upload_to_drive(local_file_path, drive_filename):
-    """Uploads local file to the dedicated Web2Drive folder on Google Drive."""
+def upload_to_drive(local_file_path: str, drive_filename: str) -> None:
+    """Uploads a local file to the dedicated Web2Drive folder on Google Drive.
+
+    Raises Web2DriveError if authentication, folder resolution, or upload fails.
+    """
     service = get_gdrive_service()
-    folder_id = get_or_create_folder(service, "Web2Drive")
+    folder_id = get_or_create_folder(service, DRIVE_FOLDER_NAME)
 
     file_metadata = {
         "name": drive_filename,
@@ -606,97 +632,19 @@ def upload_to_drive(local_file_path, drive_filename):
         print(f"✅ Successfully uploaded '{file.get('name')}' to Google Drive.")
         print(f"File ID: {file.get('id')}")
     except Exception as e:
-        print(f"Error uploading to Google Drive: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise Web2DriveError(f"Error uploading to Google Drive: {e}") from e
 
 
-def process_single_url(url):
-    """Fetches, converts, summarizes, and uploads a single URL to Google Drive."""
-    try:
-        filename, markdown_content = fetch_and_convert(url)
+def write_and_upload(document: str, filename: str) -> None:
+    """Writes a document to a temp file, uploads it, and always cleans up.
 
-        # Clean standard fallback source line to prevent duplication
-        clean_content_body = markdown_content.replace(
-            f"**Source:** {url}\n\n---\n\n", ""
-        )
-
-        # Retrieve filename and structured metadata from Gemini
-        llm_filename, metadata_header = generate_metadata_and_filename(
-            url, clean_content_body
-        )
-
-        if llm_filename and metadata_header:
-            filename = llm_filename
-            final_document = metadata_header + clean_content_body
-        else:
-            final_document = markdown_content
-
-        temp_file = tempfile.NamedTemporaryFile(
-            mode="w+", suffix=".md", delete=False, encoding="utf-8"
-        )
-        try:
-            temp_file.write(final_document)
-            temp_file.close()
-
-            print(f"⏳ Uploading to Google Drive as '{filename}'...")
-            upload_to_drive(temp_file.name, filename)
-        finally:
-            if os.path.exists(temp_file.name):
-                try:
-                    os.remove(temp_file.name)
-                except Exception as e:
-                    print(
-                        f"Warning: Could not remove temporary file {temp_file.name}: {e}",
-                        file=sys.stderr,
-                    )
-        return True
-    except Exception as e:
-        print(f"❌ Error processing {url}: {e}", file=sys.stderr)
-        return False
-
-
-def process_clipboard():
-    """Parses system clipboard content and uploads it directly to Google Drive."""
-    print("⏳ Reading content from system clipboard...")
-    raw_content = get_clipboard_content()
-    if not raw_content or not raw_content.strip():
-        print("❌ Error: Clipboard is empty or could not be read.", file=sys.stderr)
-        sys.exit(1)
-
-    url = "Clipboard"
-
-    if is_html_string(raw_content):
-        print(
-            "⏳ Detected HTML structure in clipboard. Extracting main content body..."
-        )
-        filename, markdown_content = extract_html_content(url, raw_content)
-    else:
-        print("⏳ Detected plain text/Markdown structure in clipboard.")
-        filename = "clipboard_content.md"
-        h1_match = re.search(r"^#\s+(.+)$", raw_content, re.MULTILINE)
-        if h1_match:
-            filename = f"{clean_filename(h1_match.group(1).strip())}.md"
-        markdown_content = raw_content
-
-    # Clean standard fallback source line to prevent duplication
-    clean_content_body = markdown_content.replace(f"**Source:** {url}\n\n---\n\n", "")
-
-    # Retrieve filename and structured metadata from Gemini
-    llm_filename, metadata_header = generate_metadata_and_filename(
-        url, clean_content_body
-    )
-
-    if llm_filename and metadata_header:
-        filename = llm_filename
-        final_document = metadata_header + clean_content_body
-    else:
-        final_document = markdown_content
-
+    The temp file is removed in a finally block regardless of upload outcome.
+    """
     temp_file = tempfile.NamedTemporaryFile(
         mode="w+", suffix=".md", delete=False, encoding="utf-8"
     )
     try:
-        temp_file.write(final_document)
+        temp_file.write(document)
         temp_file.close()
 
         print(f"⏳ Uploading to Google Drive as '{filename}'...")
@@ -705,14 +653,80 @@ def process_clipboard():
         if os.path.exists(temp_file.name):
             try:
                 os.remove(temp_file.name)
-            except Exception as e:
+            except OSError as e:
                 print(
                     f"Warning: Could not remove temporary file {temp_file.name}: {e}",
                     file=sys.stderr,
                 )
 
 
-def run_batch(file_path):
+def build_and_upload(url: str, fallback_filename: str, body: str) -> None:
+    """Assembles the final document from a body and uploads it.
+
+    Asks Gemini for a descriptive filename and metadata header; on failure,
+    falls back to the deterministic filename and a minimal source header. This
+    is the single shared path used by both single-URL and clipboard processing.
+    """
+    llm_filename, metadata_header = generate_metadata_and_filename(url, body)
+
+    if llm_filename and metadata_header:
+        filename = llm_filename
+        document = metadata_header + body
+    else:
+        filename = fallback_filename
+        document = format_source_header(url) + body
+
+    write_and_upload(document, filename)
+
+
+def process_single_url(url: str) -> bool:
+    """Fetches, converts, summarizes, and uploads a single URL.
+
+    Returns True on success, False on any handled failure. Errors are caught
+    here (rather than propagated) so that batch runs continue past a bad URL.
+    """
+    try:
+        fallback_filename, body = fetch_and_convert(url)
+        build_and_upload(url, fallback_filename, body)
+        return True
+    except Web2DriveError as e:
+        print(f"❌ Error processing {url}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error processing {url}: {e}", file=sys.stderr)
+        return False
+
+
+def process_clipboard() -> None:
+    """Parses system clipboard content and uploads it directly to Google Drive.
+
+    Raises Web2DriveError if the clipboard is empty/unreadable or the upload
+    fails; the caller (main) translates that into an exit code.
+    """
+    print("⏳ Reading content from system clipboard...")
+    raw_content = get_clipboard_content()
+    if not raw_content or not raw_content.strip():
+        raise Web2DriveError("Clipboard is empty or could not be read.")
+
+    url = "Clipboard"
+
+    if is_html_string(raw_content):
+        print(
+            "⏳ Detected HTML structure in clipboard. Extracting main content body..."
+        )
+        fallback_filename, body = extract_html_content(url, raw_content)
+    else:
+        print("⏳ Detected plain text/Markdown structure in clipboard.")
+        fallback_filename = "clipboard_content.md"
+        h1_match = re.search(r"^#\s+(.+)$", raw_content, re.MULTILINE)
+        if h1_match:
+            fallback_filename = f"{clean_filename(h1_match.group(1).strip())}.md"
+        body = raw_content
+
+    build_and_upload(url, fallback_filename, body)
+
+
+def run_batch(file_path: str) -> None:
     """Reads a file of URLs and sequentially processes each one."""
     if not os.path.exists(file_path):
         print(f"❌ Error: File not found at '{file_path}'", file=sys.stderr)
@@ -745,63 +759,68 @@ def run_batch(file_path):
 
     successful_uploads = 0
     for index, url in enumerate(urls, 1):
-        print(f"\n────────────────────────────────────────")
+        print("\n────────────────────────────────────────")
         print(f"📦 [{index}/{total_urls}] Processing: {url}")
-        print(f"────────────────────────────────────────")
-        success = process_single_url(url)
-        if success:
+        print("────────────────────────────────────────")
+        if process_single_url(url):
             successful_uploads += 1
 
         # Defensive pacing sleep to avoid rate limiting
         if index < total_urls:
-            time.sleep(2)
+            time.sleep(BATCH_SLEEP_SECONDS)
 
     print(
-        f"\n✨ Batch processing completed. Successfully uploaded {successful_uploads}/{total_urls} files."
+        f"\n✨ Batch processing completed. "
+        f"Successfully uploaded {successful_uploads}/{total_urls} files."
     )
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print_help()
         sys.exit(0)
 
     first_arg = sys.argv[1]
 
-    # Mode Dispatching
-    if first_arg in ("-c", "--clip"):
-        process_clipboard()
+    try:
+        # Mode dispatching
+        if first_arg in ("-c", "--clip"):
+            process_clipboard()
 
-    elif first_arg in ("-b", "--batch"):
-        if len(sys.argv) < 3:
-            print(
-                "❌ Error: Please provide the path to a text file containing URLs.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        file_path = sys.argv[2]
-        run_batch(file_path)
-
-    else:
-        # Standard input processing
-        url = first_arg
-        if not url.startswith(("http://", "https://")):
-            # Auto-detect local .txt text file as an implicit batch option
-            if os.path.exists(url) and url.endswith(".txt"):
+        elif first_arg in ("-b", "--batch"):
+            if len(sys.argv) < 3:
                 print(
-                    f"💡 Detected a local text file. Processing '{url}' in batch mode..."
-                )
-                run_batch(url)
-            else:
-                print(
-                    f"❌ Error: Invalid URL, text file path, or flag: '{url}'",
+                    "❌ Error: Please provide the path to a text file containing URLs.",
                     file=sys.stderr,
                 )
-                print_help()
                 sys.exit(1)
+            run_batch(sys.argv[2])
+
         else:
-            print(f"⏳ Extracting content from: {url}...")
-            process_single_url(url)
+            # Standard input processing
+            url = first_arg
+            if not url.startswith(("http://", "https://")):
+                # Auto-detect a local .txt file as an implicit batch option
+                if os.path.exists(url) and url.endswith(".txt"):
+                    print(
+                        f"💡 Detected a local text file. Processing '{url}' in batch mode..."
+                    )
+                    run_batch(url)
+                else:
+                    print(
+                        f"❌ Error: Invalid URL, text file path, or flag: '{url}'",
+                        file=sys.stderr,
+                    )
+                    print_help()
+                    sys.exit(1)
+            else:
+                print(f"⏳ Extracting content from: {url}...")
+                if not process_single_url(url):
+                    sys.exit(1)
+
+    except Web2DriveError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
