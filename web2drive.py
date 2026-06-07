@@ -118,24 +118,53 @@ Options:
 def get_gdrive_service():
     """Authenticates the user and returns the Drive API service.
 
-    Raises Web2DriveError if the OAuth client credentials are missing.
+    Gracefully handles expired or revoked refresh tokens by prompting
+    the user for re-authentication rather than raising an unhandled exception.
     """
     creds = None
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        except Exception as e:
+            print(
+                f"⚠️ Warning: Could not read cached token: {e}. Re-authenticating...",
+                file=sys.stderr,
+            )
+            creds = None
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS_PATH):
-                raise Web2DriveError(f"Missing credentials file at {CREDENTIALS_PATH}")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+    # Check if credentials exist but are invalid/expired
+    if creds and not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                # Attempt to refresh the token silently
+                creds.refresh(Request())
+            except Exception as e:
+                # Catch invalid_grant or other token refresh failures (common after 7 days in Testing mode)
+                print(
+                    f"⏳ Cached token has expired or was revoked ({e}). Re-authenticating...",
+                    file=sys.stderr,
+                )
+                creds = None  # Reset credentials to trigger the browser auth flow
 
+    # If no valid credentials (or silent refresh failed), launch browser authentication
+    if not creds:
+        if not os.path.exists(CREDENTIALS_PATH):
+            print(
+                f"Error: Missing credentials file at {CREDENTIALS_PATH}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Launch browser to request new authorization
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+        creds = flow.run_local_server(port=0)
+
+        # Save the new credentials
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(TOKEN_PATH, "w") as token:
             token.write(creds.to_json())
+
+    from googleapiclient.discovery import build
 
     return build("drive", "v3", credentials=creds)
 

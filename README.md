@@ -59,9 +59,20 @@ It's built for one workflow in particular: getting clean reference material — 
 
    For persistence, add that line to your shell profile (`~/.zshrc` or `~/.zshenv`) — the same file you'll use for the shell function below — and reload it with `source ~/.zshrc`. Skip this step entirely to run without LLM features.
 
-## Initial Run Authentication
+## Initial Run & Re-Authentication (Self-Healing)
 
-On your first execution, the script opens your system's default browser to authorize access to your Google Drive. The authorization token is stored at `~/.config/web2drive/token.json`, so you won't need to repeat this step on later runs.
+On your first execution, the script opens your system's default browser to authorize access to your Google Drive. The authorization token is saved to `~/.config/web2drive/token.json`, allowing subsequent runs to execute silently.
+
+### 7-Day Token Expiration (Google Testing Mode)
+
+If your Google Cloud Project’s OAuth Consent Screen is set to **"Testing"** mode, Google's security policy automatically expires authorization tokens after **7 days**.
+
+To prevent this from interrupting your workflow, Web2Drive includes an automatic **self-healing** mechanism:
+
+- When the script detects that the cached `token.json` has expired or been revoked (resulting in an `invalid_grant` error), it prints a warning to the terminal:
+  `⏳ Cached token has expired or was revoked (invalid_grant). Re-authenticating...`
+- It will automatically launch your default browser to prompt you for a fresh authorization.
+- Once completed, the script saves the new token and resumes your fetch-and-upload pipeline seamlessly without crashing.
 
 ## Session Authentication & Cookie Bypass
 
@@ -129,8 +140,6 @@ web2drive() {
   ~/Documents/scripts/python/web2drive/venv/bin/python ~/Documents/scripts/python/web2drive/web2drive.py "$@"
 }
 ```
-
-> The two hardcoded paths above must match the directory you chose in [Installation](#installation) step 1. If you configured a Gemini API key, keep its `export` line in this same file.
 
 Apply the changes to your active terminal session:
 
